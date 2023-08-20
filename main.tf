@@ -18,8 +18,18 @@ variable "region" {
   default     = "eu-central-1"
 }
 
+variable "retention" {
+  description = "retention of cloudwatch logs in days"
+  default     = 7
+}
+
+variable "prefix" {
+  default = "logs/"
+}
+
+# Binary bucket
 resource "aws_s3_bucket" "binary_bucket" {
-  bucket = "my-example-binary-bucket-for-lambda" # You should choose a unique name for this
+  bucket = "my-example-binary-bucket-for-lambda"
 }
 
 resource "aws_s3_bucket_versioning" "versioning_example" {
@@ -34,6 +44,70 @@ resource "aws_s3_object" "binary_object" {
   key    = "main.zip"
   source = "./main.zip"
   acl    = "private"
+}
+
+# Log bucket
+resource "aws_s3_bucket" "log_bucket" {
+  bucket = "my-example-log-bucket-for-lambda"
+}
+
+resource "aws_s3_bucket_logging" "example" {
+  bucket = aws_s3_bucket.binary_bucket.id
+
+  target_bucket = aws_s3_bucket.log_bucket.id
+  target_prefix = var.prefix
+}
+
+resource "aws_s3_object" "folder" {
+  bucket = aws_s3_bucket.log_bucket.bucket
+  key    = var.prefix
+  source = "/dev/null"
+}
+
+resource "aws_s3_bucket_policy" "log_bucket_policy" {
+  bucket = aws_s3_bucket.log_bucket.id
+
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Principal = {
+          Service = "logging.s3.amazonaws.com"
+        },
+        Action   = "s3:PutObject",
+        Resource = "${aws_s3_bucket.log_bucket.arn}/${var.prefix}*",
+      }
+    ]
+  })
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "example" {
+  bucket = aws_s3_bucket.log_bucket.id
+
+  rule {
+    id     = "LogCleanup"
+    status = "Enabled"
+    expiration {
+      days = 7
+    }
+  }
+}
+
+# Lambda
+resource "aws_lambda_function" "example_lambda" {
+  s3_key        = aws_s3_object.binary_object.key
+  s3_bucket     = aws_s3_bucket.binary_bucket.bucket
+  function_name = "aws_go_lambda"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "main"
+  runtime       = "go1.x"
+
+  environment {
+    variables = {
+      environment = "development"
+    }
+  }
 }
 
 resource "aws_iam_role" "lambda_role" {
@@ -51,42 +125,23 @@ resource "aws_iam_role" "lambda_role" {
   })
 }
 
-resource "aws_iam_role_policy" "lambda_s3_access" {
-  name = "LambdaS3AccessPolicy"
-  role = aws_iam_role.lambda_role.id
-
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [{
-      Action   = ["s3:GetObject"],
-      Effect   = "Allow",
-      Resource = "${aws_s3_bucket.binary_bucket.arn}/*"
-    }]
-  })
+resource "aws_iam_role_policy_attachment" "lambda_cloudwatch_logs_policy" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_lambda_function" "example_lambda" {
-  s3_bucket = aws_s3_bucket.binary_bucket.bucket
-  s3_key    = aws_s3_object.binary_object.key
-
-  function_name = "aws_go_lambda"
-  role          = aws_iam_role.lambda_role.arn
-  handler       = "main"
-  runtime       = "go1.x"
-
-  environment {
-    variables = {
-      environment = "development"
-    }
-  }
+resource "aws_cloudwatch_log_group" "lambda_log_group" {
+  name              = "/aws/lambda/aws_go_lambda"
+  retention_in_days = var.retention
 }
 
+# API Gateway
 resource "aws_apigatewayv2_api" "example_api" {
   name          = "example-api-gateway"
   protocol_type = "HTTP"
 }
 
-resource "aws_apigatewayv2_integration" "example_lambda_integration" {
+resource "aws_apigatewayv2_integration" "lambda_integration" {
   api_id                 = aws_apigatewayv2_api.example_api.id
   integration_type       = "AWS_PROXY"
   integration_method     = "POST"
@@ -97,13 +152,18 @@ resource "aws_apigatewayv2_integration" "example_lambda_integration" {
 resource "aws_apigatewayv2_route" "example_route" {
   api_id    = aws_apigatewayv2_api.example_api.id
   route_key = "GET /lambda"
-  target    = "integrations/${aws_apigatewayv2_integration.example_lambda_integration.id}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
 }
 
 resource "aws_apigatewayv2_stage" "default_stage" {
   api_id      = aws_apigatewayv2_api.example_api.id
   name        = "$default"
   auto_deploy = true
+
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_gateway_log_group.arn
+    format          = "$context.identity.sourceIp - - [$context.requestTime] \"$context.httpMethod $context.routeKey $context.protocol\" $context.status $context.responseLength $context.requestId"
+  }
 
   default_route_settings {
     logging_level = "INFO"
@@ -120,6 +180,30 @@ resource "aws_lambda_permission" "apigw_lambda_permission" {
   function_name = aws_lambda_function.example_lambda.function_name
   principal     = "apigateway.amazonaws.com"
   source_arn    = "${aws_apigatewayv2_stage.default_stage.execution_arn}/*/*"
+}
+
+resource "aws_iam_role" "apigateway_role" {
+  name = "apigateway-role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [{
+      Action = "sts:AssumeRole",
+      Effect = "Allow",
+      Principal = {
+        Service = "apigateway.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "apigateway_cloudwatch_logs_policy" {
+  role       = aws_iam_role.apigateway_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+}
+
+resource "aws_cloudwatch_log_group" "api_gateway_log_group" {
+  name              = "/aws/apigateway/${aws_apigatewayv2_api.example_api.name}"
+  retention_in_days = var.retention
 }
 
 output "api_gateway_invoke_url" {
